@@ -112,11 +112,14 @@ struct vector_type;
 
 namespace system {
 
-struct component_state_map;
-struct component_map_entry;
+struct active_partition_state;
 struct component_map;
+struct component_map_entry;
 struct component_state;
+struct component_state_map;
 struct data_point;
+struct index_statistics;
+struct layout_statistics;
 struct measurement;
 struct node_state;
 struct performance_sample;
