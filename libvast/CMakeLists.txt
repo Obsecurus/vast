@@ -192,7 +192,6 @@ set(libvast_sources
     src/system/stop_command.cpp
     src/system/task.cpp
     src/system/terminator.cpp
-    src/system/tracker.cpp
     src/system/type_registry.cpp
     src/system/version_command.cpp
     src/table_slice.cpp

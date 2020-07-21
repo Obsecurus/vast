@@ -19,7 +19,6 @@
 #include "vast/filesystem.hpp"
 #include "vast/system/archive.hpp"
 #include "vast/system/spawn_arguments.hpp"
-#include "vast/system/tracker.hpp"
 #include "vast/system/type_registry.hpp"
 
 #include <caf/actor.hpp>
@@ -34,6 +33,25 @@ namespace vast::system {
 struct node_state;
 
 using node_actor = caf::stateful_actor<node_state>;
+
+/// The state per component.
+/// @relates registry.
+struct component {
+  caf::actor actor;
+  std::string label;
+};
+
+/// Tracks all registered components.
+struct component_registry {
+  /// Maps component types to their state.
+  std::multimap<std::string, component> components;
+};
+
+/// @relates registry
+template <class Inspector>
+auto inspect(Inspector& f, registry& x) {
+  return f(caf::meta::type_name("registry"), x.components);
+}
 
 /// State of the node actor.
 struct node_state {
@@ -61,9 +79,6 @@ struct node_state {
   /// Stores the base directory for persistent state.
   path dir;
 
-  /// Points to the instance of the tracker actor.
-  tracker_type tracker;
-
   /// Stores how many components per label are active.
   std::map<std::string, size_t> labels;
 
@@ -73,17 +88,11 @@ struct node_state {
   /// Points to the node itself.
   caf::event_based_actor* self;
 
-  /// Handle to the ARCHIVE.
-  archive_type archive;
-
   /// Handle to the schema-store module.
   type_registry_type type_registry;
 
-  /// Handle to the INDEX.
-  caf::actor index;
-
-  /// Handle to the IMPORTER.
-  caf::actor importer;
+  /// The component registry
+  vast::system::component_registry registry;
 
   /// Maps command names (including parent command) to spawn functions.
   inline static named_component_factory component_factory = {};
@@ -105,4 +114,3 @@ struct node_state {
 caf::behavior node(node_actor* self, std::string id, path dir);
 
 } // namespace vast::system
-

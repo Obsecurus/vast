@@ -83,8 +83,8 @@ caf::message send_command(const invocation& inv, caf::actor_system& sys) {
   auto last = inv.arguments.end();
   // Expect exactly two arguments.
   if (std::distance(first, last) != 2)
-    return make_error_msg(ec::syntax_error,
-                          "expected two arguments: receiver and message atom");
+    return make_error_msg(ec::syntax_error, "expected two arguments: receiver "
+                                            "and message atom");
   // Get destination actor from the registry.
   auto dst = sys.registry().get(caf::atom_from_string(*first));
   if (dst == nullptr)
@@ -96,37 +96,6 @@ caf::message send_command(const invocation& inv, caf::actor_system& sys) {
     return std::move(*res);
   else
     return caf::make_message(std::move(res.error()));
-}
-
-// Tries to establish peering to another node.
-caf::message peer_command(const invocation& inv, caf::actor_system& sys) {
-  auto first = inv.arguments.begin();
-  auto last = inv.arguments.end();
-  VAST_ASSERT(this_node != nullptr);
-  if (std::distance(first, last) != 1)
-    return make_error_msg(ec::syntax_error,
-                          "expected exactly one endpoint argument");
-  auto ep = to<endpoint>(*first);
-  if (!ep)
-    return make_error_msg(ec::parse_error, "invalid endpoint format");
-  // Use localhost:42000 by default.
-  if (ep->host.empty())
-    ep->host = "127.0.0.1";
-  if (ep->port.number() == 0)
-    return make_error_msg(ec::parse_error, "cannot connect to port 0");
-  VAST_DEBUG(this_node, "connects to", ep->host, ':', ep->port);
-  auto& mm = sys.middleman();
-  // TODO: this blocks the node, consider talking to the MM actor instead.
-  auto peer = mm.remote_actor(ep->host.c_str(), ep->port.number());
-  if (!peer) {
-    VAST_ERROR(this_node, "failed to connect to peer:",
-               sys.render(peer.error()));
-    return caf::make_message(std::move(peer.error()));
-  }
-  VAST_DEBUG(this_node, "sends peering request");
-  auto& st = this_node->state;
-  this_node->delegate(*peer, atom::peer_v, st.tracker, st.name);
-  return caf::none;
 }
 
 void collect_component_status(node_actor* self,
@@ -155,11 +124,6 @@ void collect_component_status(node_actor* self,
     req_state->pending += state_map.value.size();
     for (auto& kvp : state_map.value) {
       auto& comp_state = kvp.second;
-      // Skip the tracker. It has no interesting state.
-      if (comp_state.label == "tracker") {
-        req_state->pending -= 1;
-        continue;
-      }
       self
         ->request(comp_state.actor, defaults::system::initial_request_timeout,
                   atom::status_v)
@@ -187,20 +151,7 @@ void collect_component_status(node_actor* self,
 
 caf::message status_command(const invocation&, caf::actor_system& sys) {
   auto self = this_node;
-  auto rp = self->make_response_promise();
-  caf::error err;
-  self
-    ->request(self->state.tracker, defaults::system::initial_request_timeout,
-              atom::get_v)
-    .then(
-      [=](registry& reg) mutable {
-        collect_component_status(self, std::move(rp), reg);
-      },
-      [&](caf::error& status_err) { err = status_err; });
-  if (err) {
-    VAST_ERROR(__func__, "failed to receive status:", sys.render(err));
-    return caf::make_message(std::move(err));
-  }
+  collect_component_status(self, self->make_response_promise(), registry);
   return caf::none;
 }
 
@@ -227,24 +178,21 @@ caf::message kill_command(const invocation& inv, caf::actor_system&) {
   auto first = inv.arguments.begin();
   auto last = inv.arguments.end();
   if (std::distance(first, last) != 1)
-    return make_error_msg(ec::syntax_error,
-                          "expected exactly one component argument");
+    return make_error_msg(ec::syntax_error, "expected exactly one component "
+                                            "argument");
   auto rp = this_node->make_response_promise();
-  this_node->request(this_node->state.tracker, infinite, atom::get_v)
-    .then(
-      [rp, self = this_node, label = *first](registry& reg) mutable {
-        auto& local = reg.components.value[self->state.name].value;
-        auto i = std::find_if(local.begin(), local.end(),
-                              [&](auto& p) { return p.second.label == label; });
-        if (i == local.end()) {
-          rp.deliver(
-            make_error(ec::unspecified, "no such component: " + label));
-          return;
-        }
-        self->send_exit(i->second.actor, exit_reason::user_shutdown);
-        rp.deliver(atom::ok_v);
-      },
-      [rp](error& e) mutable { rp.deliver(std::move(e)); });
+  auto& components = this_node->state.registry.components;
+  auto pred = [&](auto& x) { return x.second.label == *first; } auto i
+    = std::find_if(components.begin(), components.end(), pred);
+  if (i == components.end()) {
+    rp.deliver(make_error(ec::unspecified, "no such component: " + label));
+  } else {
+    // FIXME: currently we do NOT wait until the actor to be killed has
+    // terminated. We should instead wait until we get a DOWN from the actor
+    // and deliver the promise afterwards.
+    this_node->send_exit(i->second.actor, exit_reason::user_shutdown);
+    rp.deliver(atom::ok_v);
+  }
   return caf::none;
 }
 
@@ -264,7 +212,7 @@ node_state::component_factory_fun lift_component_factory() {
 }
 
 auto make_component_factory() {
-  return node_state::named_component_factory{
+  return node_state::named_component_factory {
     {"spawn accountant", lift_component_factory<spawn_accountant>()},
       {"spawn archive", lift_component_factory<spawn_archive>()},
       {"spawn counter", lift_component_factory<spawn_counter>()},
@@ -312,7 +260,6 @@ auto make_command_factory() {
   // application.cpp as well iff necessary
   return command::factory{
     {"kill", kill_command},
-    {"peer", peer_command},
     {"send", send_command},
     {"spawn accountant", node_state::spawn_command},
     {"spawn archive", node_state::spawn_command},
@@ -391,13 +338,10 @@ node_state::spawn_command(const invocation& inv,
                    "got an error from spawn_component:", sys.render(err));
     return caf::make_message(std::move(err));
   }
-  // Register component at tracker.
+  // Register component.
   auto rp = this_node->make_response_promise();
-  this_node
-    ->request(st.tracker, infinite, atom::try_put_v, std::move(comp_name),
-              new_component, std::move(label))
-    .then([=]() mutable { rp.deliver(std::move(new_component)); },
-          [=](error& e) mutable { rp.deliver(std::move(e)); });
+  rp.delegate(this_node, infinite, atom::put_v, std::move(comp_name),
+              new_component, std::move(label));
   return caf::none;
 }
 
@@ -422,28 +366,19 @@ void node_state::init(std::string init_name, path init_dir) {
                  node_state::command_factory.end());
     node_state::command_factory = std::move(extra);
   }
-  // Set member variables.
   name = std::move(init_name);
   dir = std::move(init_dir);
-  // Bring up the tracker.
-  tracker = self->spawn<linked>(system::tracker, name);
   // Initialize the file system with the node directory as root.
   auto fs = self->spawn<linked + detached>(posix_filesystem, dir);
   self->system().registry().put(atom::filesystem_v, fs);
+  self->set_down_handler([=](const down_msg& msg) {
+    VAST_DEBUG(self, "got DOWN from", msg.source);
+    auto& components = self->state.registry.components;
+    for (auto i = components.begin(); i != components.end(); ++i)
+      if (i->second.actor == msg.source)
+        components.erase(i);
+  });
   self->set_exit_handler([=](const exit_msg& msg) {
-    VAST_DEBUG(self, "got EXIT from", msg.source);
-    /// Collect all actors that we shutdown in sequence. First, we terminate
-    /// the accountant because it acts like a source and flush buffered data.
-    /// Thereafter, we tear down the ingestion pipeline from source to sink.
-    /// Finally, after everything has exited, we can terminate the filesystem.
-    std::vector<caf::actor> actors;
-    if (auto acc = self->system().registry().get(atom::accountant_v))
-      actors.push_back(caf::actor_cast<caf::actor>(acc));
-    actors.push_back(caf::actor_cast<caf::actor>(tracker));
-    auto fs = self->system().registry().get(atom::filesystem_v);
-    VAST_ASSERT(fs);
-    actors.push_back(caf::actor_cast<caf::actor>(fs));
-    shutdown<policy::sequential>(self, std::move(actors));
     self->attach_functor([=](const caf::error&) {
       VAST_DEBUG(self, "terminated all dependent actors");
       // Clean up. This is important for detached actors, otherwise they
@@ -452,6 +387,33 @@ void node_state::init(std::string init_name, path init_dir) {
       self->system().registry().erase(atom::accountant_v);
       self->system().registry().erase(atom::filesystem_v);
     });
+    VAST_DEBUG(self, "got EXIT from", msg.source);
+    /// Collect all actors that we shutdown in sequence. First, we terminate
+    /// the accountant because it acts like a source and flush buffered data.
+    /// Thereafter, we tear down the ingestion pipeline from source to sink.
+    /// Finally, after everything has exited, we can terminate the filesystem.
+    std::vector<caf::actor> actors;
+    if (auto acc = self->system().registry().get(atom::accountant_v))
+      actors.push_back(caf::actor_cast<caf::actor>(acc));
+    auto pipeline = {"source", "importer", "archive", "index", "exporter"};
+    auto& components = self->state.registry.components;
+    for (auto& comp_type : pipeline) {
+      auto er = components.equal_range(comp_type);
+      for (auto i = er.first; i != er.second; ++i) {
+        self->demonitor(i->second.actor);
+        actors.push_back(i->second.actor);
+      }
+      components.erase(er.first, er.second);
+    }
+    // Add remaining components.
+    for ([[maybe_unused]] auto& [_, comp] : components) {
+      self->demonitor(comp.actor);
+      actors.push_back(comp.actor);
+    }
+    auto fs = self->system().registry().get(atom::filesystem_v);
+    VAST_ASSERT(fs);
+    actors.push_back(caf::actor_cast<caf::actor>(fs));
+    shutdown<policy::sequential>(self, std::move(actors));
   });
 }
 
@@ -465,18 +427,52 @@ caf::behavior node(node_actor* self, std::string id, path dir) {
       this_node = self;
       return run(inv, self->system(), node_state::command_factory);
     },
-    [=](atom::peer, actor& tracker, std::string& peer_name) {
-      self->delegate(self->state.tracker, atom::peer_v, std::move(tracker),
-                     std::move(peer_name));
+    [=](atom::put, const std::string& type, const actor& component,
+        const std::string& label) -> result<atom::ok> {
+      VAST_DEBUG(self, "got new", type, "with label", label);
+      // Check if the new component is a singleton.
+      auto is_singleton = [](auto comp) {
+        const char* singletons[]
+          = {"archive", "importer", "index", "type-registry", "eraser"};
+        auto pred = [&](const char* lhs) { return lhs == comp; };
+        return std::any_of(std::begin(singletons), std::end(singletons), pred);
+      };
+      auto& components = self->state.registry.components;
+      if (is_singleton(type) && components.count(type) > 0)
+        return make_error(ec::unspecified, "component already exists");
+      // Register and wire the component.
+      self->monitor(component);
+      components.insert(type, {component, label});
+      // Wire it to existing components.
+      auto actors = [&](auto key) {
+        std::vector<actor> result;
+        auto er = components.equal_range(key);
+        for (auto i = er.first; i != er.second; ++i)
+          result.push_back(i->second.actor);
+        return result;
+      };
+      if (type == "exporter") {
+        for (auto& a : actors("archive"))
+          self->send(component, actor_cast<archive_type>(a));
+        for (auto& a : actors("index"))
+          self->send(component, atom::index_v, a);
+        for (auto& a : actors("sink"))
+          self->send(component, atom::sink_v, a);
+      } else if (type == "importer") {
+        for (auto& a : actors("source"))
+          self->send(a, atom::sink_v, component);
+      } else if (type == "sink") {
+        for (auto& a : actors("exporter"))
+          self->send(a, atom::sink_v, component);
+      }
+      return atom::ok_v;
     },
-    [=](atom::get) {
-      auto rp = self->make_response_promise();
-      self->request(self->state.tracker, infinite, atom::get_v)
-        .then(
-          [=](registry& reg) mutable {
-            rp.deliver(self->state.name, std::move(reg));
-          },
-          [=](error& e) mutable { rp.deliver(std::move(e)); });
+    [=](atom::get) -> result<component_registry> {
+      return self->state.registry;
+    },
+    [=](atom::get, const std::string& type) -> result<std::vector<component>> {
+      auto result = std::vector<component>{};
+      return self->state.registry;
     },
     [=](atom::signal, int signal) {
       VAST_IGNORE_UNUSED(signal);
