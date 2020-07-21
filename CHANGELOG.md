@@ -27,6 +27,7 @@ Every entry has a category for which we use the following visual abbreviations:
   you can pass `--table-slice-type=msgpack` to the `import` command, or set the
   configuration option `import.table-slice-type` to `'msgpack'`.
   [#975](https://github.com/tenzir/vast/pull/975)
+  [#984](https://github.com/tenzir/vast/pull/984)
 
 - 🎁 Starting with this release, installing VAST on any Linux becomes
   significantly easier: A static binary will be provided with each release on
